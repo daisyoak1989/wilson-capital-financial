@@ -260,7 +260,9 @@ t12.column_dimensions[get_column_letter(NOTES_COL)].width = 60
 for col in (15, 16, 17):
     t12.column_dimensions[get_column_letter(col)].width = 13
 
-# fill budget values for every matched line-item row (blank for subtotals)
+# fill budget values for every row: line items match by name+bucket,
+# subtotals/totals match against the Budget Comparison subtotal rows by
+# name. Section headers (GL code -000) carry no budget, left blank.
 for r in range(6, t12.max_row + 1):
     code = t12.cell(r, 1).value
     name = t12.cell(r, 2).value
@@ -268,13 +270,19 @@ for r in range(6, t12.max_row + 1):
         continue
     nm = name.strip()
     if is_subtotal(code, nm):
-        continue
-    b = lookup_budget(nm, t12_bucket(code))
+        if isinstance(code, str) and code.endswith("-000"):
+            continue
+        cand = bc_subtotals.get(norm(nm))
+        b = cand[0] if cand else None
+    else:
+        b = lookup_budget(nm, t12_bucket(code))
     if not b:
         continue
     for col, key in ((15, "pb"), (16, "ya"), (17, "yb")):
         cell = t12.cell(r, col, round(b[key], 2))
         cell.number_format = "#,##0"
+        if is_subtotal(code, nm):
+            cell.font = Font(bold=True)
 
 # group oldest 6 months C..H (collapsed) and freeze at C6
 t12.column_dimensions.group("C", "H", hidden=True)
