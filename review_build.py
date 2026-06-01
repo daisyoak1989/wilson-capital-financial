@@ -16,6 +16,17 @@ from pathlib import Path
 WB = Path(r"H:\.shortcut-targets-by-id\15cPT84Tcymc9b2jqyLRYJjcuEXIBOfOp\0. Business\Multi Family\!!! W.C. Portfolio\!!! Brio\Financial\202605\Brio_Financial_Analysis_202605.xlsx")
 
 wb = openpyxl.load_workbook(WB)
+
+# The combined workbook may contain text labels like "= Beginning Balance ="
+# (common in the GL) that were stored with formula data_type. Excel strips
+# these on open ("Removed Records: Formula"). Coerce any formula-typed cell
+# back to a plain string so the re-saved workbook opens cleanly.
+for ws in wb.worksheets:
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.data_type == "f" and isinstance(cell.value, str):
+                cell.data_type = "s"
+
 t12 = wb["T12"]
 bc = wb["Budget Comparison"]
 
@@ -32,6 +43,61 @@ LIGHTBLUE = PatternFill("solid", fgColor="BDD7EE")
 DARKBLUE = PatternFill("solid", fgColor="1F4E79")
 WHITE_BOLD = Font(color="FFFFFF", bold=True)
 WRAP = Alignment(wrap_text=True, vertical="top")
+
+# =======================================================================
+# Dynamic structure discovery — robust to row shifts month-to-month.
+# Never hardcode row numbers: the T12 is a rolling window and line items
+# get added/removed, so find everything by name / GL-code suffix.
+# =======================================================================
+def is_subtotal(code, name):
+    if isinstance(code, str) and code.endswith(("-099", "-098", "-090", "-999", "-199")):
+        return True
+    nm = name.strip() if name else ""
+    return ("Total" in nm) or nm.isupper()
+
+def t12_find(exact_name):
+    target = norm(exact_name)
+    for r in range(6, t12.max_row + 1):
+        if norm(t12.cell(r, 2).value) == target:
+            return r
+    return None
+
+NOI_ROW = t12_find("Net Operating Income")
+TOTAL_INCOME_ROW = t12_find("Total Income")
+TOTAL_OPEX_ROW = t12_find("Total Operating Expenses")
+NET_INCOME_ROW = t12_find("Net Income")
+TOTAL_COL = 18  # original Total col O(15) shifts to R(18) after 3 budget cols inserted
+
+# Ordered list of every T12 subtotal/total row, plus the individual line
+# rows that roll up into each (the lines since the previous subtotal).
+t12_subtotal_rows = []
+members = {}
+_pending = []
+for r in range(6, t12.max_row + 1):
+    nm = t12.cell(r, 2).value
+    if not nm:
+        continue
+    if is_subtotal(t12.cell(r, 1).value, nm):
+        t12_subtotal_rows.append(r)
+        members[r] = _pending
+        _pending = []
+    else:
+        _pending.append(r)
+
+# Budget Comparison subtotal rows, keyed by normalized name (BC has no
+# GL-code column, so subtotals are detected by name only).
+def bc_cells(r):
+    return dict(r=r, pa=num(bc.cell(r, 2).value), pb=num(bc.cell(r, 3).value),
+                ya=num(bc.cell(r, 6).value), yb=num(bc.cell(r, 7).value))
+
+bc_subtotals = {}
+for r in range(6, 252):
+    nm = bc.cell(r, 1).value
+    if not nm:
+        continue
+    s = nm.strip()
+    if ("Total" in s) or s.isupper() or norm(s) in ("potential rent", "net operating income", "net income"):
+        bc_subtotals.setdefault(norm(s), []).append(bc_cells(r))
 
 # =======================================================================
 # Build budget lookup (by name, bucketed by section) BEFORE editing sheets
@@ -73,15 +139,15 @@ def lookup_budget(name, bucket):
     same = [c for c in cands if c["bucket"] == bucket]
     return (same or cands)[0]
 
-# subtotal budget rows for summary comments (by explicit row)
-def bc_row(r):
-    return dict(pa=num(bc.cell(r,2).value), pb=num(bc.cell(r,3).value),
-                ya=num(bc.cell(r,6).value), yb=num(bc.cell(r,7).value))
+# subtotal budget figures for the exec-summary metrics (matched by name)
+def bc_sub(name):
+    cand = bc_subtotals.get(norm(name))
+    return cand[0] if cand else dict(pa=0, pb=0, ya=0, yb=0)
 SUB_BUDGET = {
-    "rental": bc_row(24),   # Total Rental Inc. - Residential
-    "income": bc_row(54),   # Total Income
-    "opex":   bc_row(206),  # Total Operating Expenses
-    "noi":    bc_row(210),  # Net Operating Income
+    "rental": bc_sub("Total Rental Inc. - Residential"),
+    "income": bc_sub("Total Income"),
+    "opex":   bc_sub("Total Operating Expenses"),
+    "noi":    bc_sub("Net Operating Income"),
 }
 
 # =======================================================================
@@ -90,12 +156,6 @@ SUB_BUDGET = {
 REVIEW, PRIOR = 14, 13
 M3 = [11, 12, 13]
 M12 = list(range(3, 15))
-NOI_ROW = 221
-
-def is_subtotal(code, name):
-    if isinstance(code, str) and code.endswith(("-099", "-098", "-090", "-999", "-199")):
-        return True
-    return ("Total" in name) or name.strip().isupper()
 
 t12_flags = {}
 for r in range(6, NOI_ROW):
@@ -231,35 +291,47 @@ for r, (sev, note) in t12_flags.items():
     cell = t12.cell(r, NOTES_COL, full)
     cell.alignment = WRAP
 
-# summary-row variance comments (no highlight)
-def drivers(bucket_filter, ptd=True):
-    pool = [it for recs in budget_by_name.values() for it in recs if bucket_filter(it)]
+# variance-summary comments on EVERY subtotal/total row (no highlight).
+# Drivers = the individual line items that roll into that subtotal, ranked
+# by absolute budget variance.
+def member_drivers(sub_row, ptd=True):
     key = "pv" if ptd else "yv"
-    top = sorted(pool, key=lambda x: -abs(x[key]))[:3]
-    return ", ".join(f"{it['name']} ({it[key]:+,.0f})" for it in top if abs(it[key]) > 1000)
+    found = []
+    for mr_ in members.get(sub_row, []):
+        nm = t12.cell(mr_, 2).value
+        if not nm:
+            continue
+        b = lookup_budget(nm.strip(), t12_bucket(t12.cell(mr_, 1).value))
+        if b:
+            found.append((nm.strip(), b[key]))
+    found.sort(key=lambda x: -abs(x[1]))
+    return ", ".join(f"{n} ({v:+,.0f})" for n, v in found[:3] if abs(v) > 1000)
 
-def summary_comment(title, sub, inc_filter):
-    s = SUB_BUDGET[sub]
-    pv = s["pa"] - s["pb"]; pvp = pv / s["pb"] * 100 if s["pb"] else 0
-    yv = s["ya"] - s["yb"]; yvp = yv / s["yb"] * 100 if s["yb"] else 0
-    return (f"═══ {title} — VARIANCE SUMMARY ═══\n"
-            f"PTD: ${s['pa']:,.0f} vs. ${s['pb']:,.0f} ({pv:+,.0f}, {pvp:+.1f}%)\n"
-            f"  Drivers: {drivers(inc_filter, True)}\n"
-            f"YTD: ${s['ya']:,.0f} vs. ${s['yb']:,.0f} ({yv:+,.0f}, {yvp:+.1f}%)\n"
-            f"  Drivers: {drivers(inc_filter, False)}")
-
-inc = lambda it: it["bucket"] == "income"
-rental = lambda it: it["bucket"] == "income" and it["r"] <= 22
-opx = lambda it: it["bucket"] == "opex"
-allabove = lambda it: it["bucket"] in ("income", "opex")
-SUMMARY_ROWS = {
-    25:  ("TOTAL RENTAL INCOME", "rental", rental),
-    58:  ("TOTAL INCOME", "income", inc),
-    217: ("TOTAL OPERATING EXPENSES", "opex", opx),
-    221: ("NET OPERATING INCOME", "noi", allabove),
-}
-for r, (title, sub, filt) in SUMMARY_ROWS.items():
-    cell = t12.cell(r, NOTES_COL, summary_comment(title, sub, filt))
+for sub_row in t12_subtotal_rows:
+    code = t12.cell(sub_row, 1).value
+    nm = t12.cell(sub_row, 2).value.strip()
+    # section/sub-section headers (GL code ends -000, e.g. INCOME, EXPENSES,
+    # HVAC) carry no totals — they're boundaries, not roll-ups. Skip.
+    if isinstance(code, str) and code.endswith("-000"):
+        continue
+    rev = num(t12.cell(sub_row, REVIEW).value)
+    tot = num(t12.cell(sub_row, TOTAL_COL).value)
+    cand = bc_subtotals.get(norm(nm))
+    if cand:
+        s = cand[0]
+        pv = s["pa"] - s["pb"]; pvp = pv / s["pb"] * 100 if s["pb"] else 0
+        yv = s["ya"] - s["yb"]; yvp = yv / s["yb"] * 100 if s["yb"] else 0
+        pd = member_drivers(sub_row, True); yd = member_drivers(sub_row, False)
+        txt = (f"═══ {nm.upper()} — VARIANCE SUMMARY ═══\n"
+               f"PTD: ${s['pa']:,.0f} vs. ${s['pb']:,.0f} ({pv:+,.0f}, {pvp:+.1f}%)"
+               + (f"\n  Drivers: {pd}" if pd else "")
+               + f"\nYTD: ${s['ya']:,.0f} vs. ${s['yb']:,.0f} ({yv:+,.0f}, {yvp:+.1f}%)"
+               + (f"\n  Drivers: {yd}" if yd else ""))
+    else:
+        txt = (f"═══ {nm.upper()} — SUMMARY ═══\n"
+               f"Review month ${rev:,.0f}  |  12-mo total ${tot:,.0f}\n"
+               f"(no matching line in Budget Comparison)")
+    cell = t12.cell(sub_row, NOTES_COL, txt)
     cell.alignment = WRAP
     cell.font = Font(italic=True, color="1F4E79")
 
@@ -302,9 +374,9 @@ def pct(cell):
     cell.number_format = "0.0%"
 
 REV, PRI = 14, 13
-ti = num(t12.cell(58, REV).value); ti_p = num(t12.cell(58, PRI).value)
-oe = num(t12.cell(217, REV).value); oe_p = num(t12.cell(217, PRI).value)
-noi = num(t12.cell(221, REV).value); noi_p = num(t12.cell(221, PRI).value)
+ti = num(t12.cell(TOTAL_INCOME_ROW, REV).value); ti_p = num(t12.cell(TOTAL_INCOME_ROW, PRI).value)
+oe = num(t12.cell(TOTAL_OPEX_ROW, REV).value); oe_p = num(t12.cell(TOTAL_OPEX_ROW, PRI).value)
+noi = num(t12.cell(NOI_ROW, REV).value); noi_p = num(t12.cell(NOI_ROW, PRI).value)
 b = SUB_BUDGET
 
 mr.cell(1, 1, "Brio (txbrio) — Monthly Financial Review").font = Font(bold=True, size=16)
@@ -375,11 +447,11 @@ row = sec(mr, row, "3. BELOW-THE-LINE SUMMARY")
 for i, h in enumerate(["GL Code", "Line Item", "May 2026", "12-Mo Total", "Note"], 1):
     c = mr.cell(row, i, h); c.fill = DARKBLUE; c.font = WHITE_BOLD
 row += 1
-for r in range(222, 270):
+for r in range(NOI_ROW + 1, t12.max_row + 1):
     code = t12.cell(r, 1).value; name = t12.cell(r, 2).value
     if not name: continue
     nm = name.strip()
-    rev = num(t12.cell(r, REV).value); tot = num(t12.cell(r, 18).value)  # Total now col R(18)
+    rev = num(t12.cell(r, REV).value); tot = num(t12.cell(r, TOTAL_COL).value)
     if is_subtotal(code, nm):
         if nm in ("Total Routine Replacement Expense", "Total Capital / Renovation Expense",
                   "Total Debt Service", "NOI After Replacements", "Net Income"):
@@ -393,8 +465,9 @@ for r in range(222, 270):
     if nm == "Interest Expense - 1st Mortgage":
         mr.cell(row, 5, "Debt service; varies by days-in-month, on budget. Primary driver of net loss.").alignment = WRAP
     row += 1
+net_income = num(t12.cell(NET_INCOME_ROW, REV).value)
 mr.cell(row, 2, "NOI-to-Net-Income bridge:").font = Font(bold=True)
-mr.cell(row, 3, f"NOI ${noi:,.0f}  →  Net Income ${num(t12.cell(269, REV).value):,.0f}  (below-line drag ${num(t12.cell(269, REV).value)-noi:,.0f}, ~all debt service)")
+mr.cell(row, 3, f"NOI ${noi:,.0f}  →  Net Income ${net_income:,.0f}  (below-line drag ${net_income-noi:,.0f}, ~all debt service)")
 mr.cell(row, 3).alignment = WRAP
 row += 3
 

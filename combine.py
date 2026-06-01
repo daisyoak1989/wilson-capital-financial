@@ -21,6 +21,10 @@ def copy_sheet(src_ws, dst_ws):
     for row in src_ws.iter_rows():
         for cell in row:
             new_cell = dst_ws.cell(row=cell.row, column=cell.column, value=cell.value)
+            # text labels that start with "=" (e.g. "= Beginning Balance =") must
+            # stay strings, not be reinterpreted as formulas
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                new_cell.data_type = "s"
             if cell.has_style:
                 new_cell.font = copy(cell.font)
                 new_cell.border = copy(cell.border)
