@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*credentials*.json
+*.db
+.cache/
+.session/
+profile/
