@@ -195,6 +195,10 @@ for r in range(6, NOI_ROW):
         reasons.append(f"bad debt {abs(rev)/abs(a3):.0%} of 3-mo avg"); sev = "High"
     if "Vacancy Loss" in name and a3 and abs(rev) > 1.2*abs(a3) and abs(rev) > 5000:
         reasons.append(f"vacancy {abs(rev)/abs(a3):.0%} of 3-mo avg"); sev = sev or "Moderate"
+    # Data-quality: positive value in a contra/bad-debt account (house rule B.6)
+    if "Bad Debt" in name and rev > 0:
+        reasons.append(f"POSITIVE in a contra/bad-debt account (${rev:,.0f}) — confirm recovery "
+                       f"or recategorize (e.g., to Accelerated Rent)"); sev = sev or "Moderate"
     if is_opex:
         if pm is not None and abs(pm) > 0.25 and abs(rev - prior) > 1000:
             reasons.append(f"{pm:+.0%} vs prior (${rev:,.0f} vs ${prior:,.0f})"); sev = sev or "Moderate"
@@ -214,6 +218,10 @@ for r in range(6, NOI_ROW):
         # suppress the Electric Commissions false positive (one-time item, $0 is normal)
         if name == "Electric Commissions":
             continue
+        # Brio override: Consulting/Professional Fees is the owner's own $3K/mo
+        # consulting fee — expected, not a concern (see REVIEW_METHODOLOGY.md).
+        if name == "Consulting / Professional Fees":
+            continue
         t12_flags[r] = (sev or "Moderate", "; ".join(reasons))
 
 # GL findings to enrich notes (manual from Phase 5)
@@ -228,8 +236,11 @@ GL_NOTES = {
 # Compute Budget flags (Phase 4)  -> {bc_row: (sev, note)}
 # =======================================================================
 bc_flags = {}
+SUPPRESS = {"Consulting / Professional Fees"}  # Brio: owner's own consulting fee
 for recs in budget_by_name.values():
     for it in recs:
+        if it["name"] in SUPPRESS:
+            continue
         fl = []; sev = None
         if it["pv"] < 0 and abs(it["pp"]) > 50 and abs(it["pv"]) > 2500:
             fl.append("PTD"); sev = "High"
@@ -507,18 +518,23 @@ vtable("PTD — Largest Unfavorable Variances", "pv", "pp")
 vtable("YTD — Largest Unfavorable Variances", "yv", "yp")
 
 # Section 5: questions for PM
+# House rules (see REVIEW_METHODOLOGY.md): questions are CURRENT-MONTH (MTD) only —
+# no YTD-driven questions; skip items favorable/in-line with budget; Gain/Loss to
+# Lease is expected; Make-Ready framed with vacancy/move-in context; Tax/Ins/Mortgage
+# are self-checked against the portfolio reference table, not asked.
 row = sec(mr, row, "5. QUESTIONS FOR PROPERTY MANAGER")
+scope = ("Scope: questions cover the current review month (MTD). YTD trends are "
+         "summarized in Sections 1 & 4 for context only. Tax, insurance, and mortgage "
+         "are tracked against the portfolio reference table, not raised here.")
+sc_cell = mr.cell(row, 2, scope); sc_cell.alignment = WRAP; sc_cell.font = Font(italic=True, color="1F4E79")
+mr.merge_cells(start_row=row, start_column=2, end_row=row, end_column=9)
+row += 1
 questions = [
-    "Consulting/Professional Fees: $10,285 to 'Oak Real Estate Investment' (Feb–Apr invoices booked in May), unbudgeted. What is this engagement, why is it unbudgeted, and is it a related party?",
-    "Locator & Broker Referrals: $13,660 in May (+646% vs 3-mo avg), $8,186 over PTD budget. Please confirm each commission ties to a signed lease (Competitive Edge Realty, 4 leases).",
-    "Payroll spiked across all salary lines in May (Mgmt +40%, Asst Mgmt +55%, Maintenance +49%, Grounds +82%). Was May a 3-paycheck month? (Note: payroll is still favorable to budget.)",
-    "Make-ready / turnover costs over budget: Paint Contractor (YTD -$10,567), Carpets (YTD -$12,416), Other Make-Ready (YTD -$8,737). What is turn volume vs. plan?",
-    "Gain/Loss to Lease worse than budget (PTD -$20,607, YTD -$49,464). Are new/renewal leases being signed below market?",
-    "Vacancy Loss YTD -$56,651 vs budget (-26%). What is current occupancy vs. underwriting?",
-    "Bad Debt - Rent YTD -$35,256 vs budget (May favorable). What is the delinquency trend and collections plan?",
-    "Resident Retention YTD $31,601 vs $1,150 budget (driven by Jan $13,111 & Apr $12,168). What were these spends and the ROI on retention?",
-    "Property Insurance came in under budget ($17,121 vs $21,250). Please confirm the renewed premium and policy term.",
-    "Lease Cancellation Fee income $0 vs budget (YTD -$8,610). Is this fee still being charged/collected?",
+    "Locator & Broker Referrals: $13,660 this month (+646% vs 3-mo avg), $8,186 over PTD budget. Please confirm each commission ties to a signed lease (Competitive Edge Realty, 4 leases).",
+    "Make-Ready / turnover (Paint Contractor, Carpets, Other Make-Ready) ran over budget this month — this looks consistent with elevated move-ins / declining vacancy. Please confirm the turn count this month so we can tie make-ready spend to move-in volume.",
+    "Lease Cancellation Fee income was $0 this month vs. budget. Is this fee still being charged and collected?",
+    "Bad Debt – Accelerated Rent shows a POSITIVE balance. Was this amount recovered, or should it be reclassified out of Bad Debt (e.g., into Accelerated Rent)?",
+    "Internet Listing Services (Zillow, 54012-000): the Feb and March accruals were reversed with no offsetting actual expense booked, so those months understate ILS cost. Please confirm the true monthly ILS amount and rebook the missing actuals.",
 ]
 for i, q in enumerate(questions, 1):
     mr.cell(row, 1, i)

@@ -16,12 +16,43 @@ def serial_to_date(v):
 
 codes = sys.argv[1:] if len(sys.argv) > 1 else []
 
+def num(v):
+    return v if isinstance(v, (int, float)) else 0.0
+
 # Find section header rows: column A holds a GL code like 54050-000
 header_rows = []
 for r in range(1, gl.max_row + 1):
     a = gl.cell(r, 1).value
     if isinstance(a, str) and len(a) >= 8 and a[5:6] == "-" and a[:5].isdigit():
         header_rows.append((r, a, gl.cell(r, 5).value))
+
+_srt = sorted(r for r, _, _ in header_rows)
+
+# --rev : accrual-reversal scan (house rule C.7). Flags expense accounts where the
+# review month booked reversals (credits) with little/no offsetting actual (debit) —
+# the signature of "accrual reversed but no actual posted". Credits are normal in
+# accrual accounting, so this only surfaces sections where credits dominate.
+if codes and codes[0] in ("--rev", "--reversals"):
+    print("Accrual-reversal scan - expense accounts where credits (reversals) are not "
+          "offset by actual debits (net credit or near-zero net with credits present):")
+    print("-" * 95)
+    hits = 0
+    for start, code, nm in header_rows:
+        if code[:1] not in ("5", "6"):
+            continue
+        end = next((r for r in _srt if r > start), gl.max_row + 1)
+        deb = sum(num(gl.cell(r, 8).value) for r in range(start + 1, end))
+        cred = sum(num(gl.cell(r, 9).value) for r in range(start + 1, end))
+        if cred <= 0:
+            continue
+        net = deb - cred
+        # candidate: net is a credit, OR debit barely covers the reversal
+        if net < 0 or (deb < 0.25 * cred):
+            hits += 1
+            print(f"  {code} {str(nm).strip():<42} debit={deb:>10,.0f} credit={cred:>10,.0f} "
+                  f"net={net:>10,.0f}  <-- check: reversal may lack offsetting actual")
+    print(f"\n{hits} candidate section(s). Review each with: gl_dive.py <code>")
+    sys.exit()
 
 if not codes:
     print(f"GL has {len(header_rows)} account sections. First 8 cols of row 5-8 for layout:")
