@@ -9,12 +9,33 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-# (source filename, target tab name)
+# Source files are detected by glob pattern — filenames embed each property's
+# code (e.g. "txbrio"), so we match by shape rather than an exact name.
+# (patterns tried in order, target tab name)
 SOURCES = [
-    ("12_Month_Statement_txbrio_Accrual.xlsx", "T12"),
-    ("Budget_Comparison_txbrio_Accrual (1).xlsx", "Budget Comparison"),
-    ("GeneralLedger_txbrio_Accrual.xlsx", "GL"),
+    (["*12_Month_Statement*", "*12*Month*Statement*", "*T12*"], "T12"),
+    (["*Budget_Comparison*", "*Budget*Comparison*"], "Budget Comparison"),
+    (["*GeneralLedger*", "*General*Ledger*"], "GL"),
 ]
+
+
+def find_source(folder, patterns):
+    """First .xlsx in folder matching any pattern, skipping our own outputs/temp files."""
+    for pat in patterns:
+        for p in sorted(folder.glob(pat)):
+            if (p.suffix.lower() == ".xlsx" and "Financial_Analysis" not in p.name
+                    and not p.name.startswith("~$")):
+                return p
+    return None
+
+
+def property_name(folder):
+    """Derive the property name from the path (folder named like '!!! Brio')."""
+    for parent in folder.parents:
+        n = parent.name
+        if n.startswith("!!!") and "Portfolio" not in n:
+            return n.lstrip("! ").strip()
+    return None
 
 
 def copy_sheet(src_ws, dst_ws):
@@ -58,21 +79,26 @@ def main():
     args = parser.parse_args()
 
     folder = Path(args.folder)
-    out = Path(args.output) if args.output else folder / f"Brio_Financial_Analysis_{folder.name}.xlsx"
+    if args.output:
+        out = Path(args.output)
+    else:
+        prop = property_name(folder)
+        prefix = (prop.replace(" ", "_") + "_") if prop else ""
+        out = folder / f"{prefix}Financial_Analysis_{folder.name}.xlsx"
 
     dst_wb = openpyxl.Workbook()
     dst_wb.remove(dst_wb.active)
 
-    for filename, tab in SOURCES:
-        src_path = folder / filename
-        if not src_path.exists():
-            raise FileNotFoundError(src_path)
+    for patterns, tab in SOURCES:
+        src_path = find_source(folder, patterns)
+        if src_path is None:
+            raise FileNotFoundError(f"No source for tab {tab!r} in {folder} (patterns: {patterns})")
         src_wb = openpyxl.load_workbook(src_path, data_only=False)
         src_ws = src_wb.worksheets[0]
         dst_ws = dst_wb.create_sheet(title=tab)
         copy_sheet(src_ws, dst_ws)
         src_wb.close()
-        print(f"  {filename}  ->  tab {tab!r}  ({src_ws.max_row} rows x {src_ws.max_column} cols)")
+        print(f"  {src_path.name}  ->  tab {tab!r}  ({src_ws.max_row} rows x {src_ws.max_column} cols)")
 
     dst_wb.save(out)
     print(f"\nSaved: {out}")

@@ -3,7 +3,13 @@ import openpyxl
 from pathlib import Path
 from datetime import datetime, timedelta
 
+# Workbook: pass `--wb <path>`; defaults to Brio May 2026.
+_args = sys.argv[1:]
 WB = Path(r"H:\.shortcut-targets-by-id\15cPT84Tcymc9b2jqyLRYJjcuEXIBOfOp\0. Business\Multi Family\!!! W.C. Portfolio\!!! Brio\Financial\202605\Brio_Financial_Analysis_202605.xlsx")
+if "--wb" in _args:
+    i = _args.index("--wb")
+    WB = Path(_args[i + 1])
+    del _args[i:i + 2]
 wb = openpyxl.load_workbook(WB, data_only=True)
 gl = wb["GL"]
 
@@ -14,7 +20,7 @@ def serial_to_date(v):
         return (datetime(1899, 12, 30) + timedelta(days=v)).strftime("%Y-%m-%d")
     return str(v) if v is not None else ""
 
-codes = sys.argv[1:] if len(sys.argv) > 1 else []
+codes = _args
 
 def num(v):
     return v if isinstance(v, (int, float)) else 0.0

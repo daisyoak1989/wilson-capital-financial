@@ -8,12 +8,17 @@ actual columns present (A name, B PTDact, C PTDbud, D PTDvar, E PTD%, F YTDact,
 G YTDbud, H YTDvar, I YTD%, J Annual)."""
 
 import re
+import sys
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from pathlib import Path
 
-WB = Path(r"H:\.shortcut-targets-by-id\15cPT84Tcymc9b2jqyLRYJjcuEXIBOfOp\0. Business\Multi Family\!!! W.C. Portfolio\!!! Brio\Financial\202605\Brio_Financial_Analysis_202605.xlsx")
+# Workbook path: pass the combined workbook as argv[1]; falls back to Brio May 2026.
+DEFAULT_WB = Path(r"H:\.shortcut-targets-by-id\15cPT84Tcymc9b2jqyLRYJjcuEXIBOfOp\0. Business\Multi Family\!!! W.C. Portfolio\!!! Brio\Financial\202605\Brio_Financial_Analysis_202605.xlsx")
+WB = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_WB
+# Property-specific overrides only apply to the property they belong to.
+PROPERTY_IS_BRIO = "brio" in str(WB).lower()
 
 wb = openpyxl.load_workbook(WB)
 
@@ -220,23 +225,25 @@ for r in range(6, NOI_ROW):
             continue
         # Brio override: Consulting/Professional Fees is the owner's own $3K/mo
         # consulting fee — expected, not a concern (see REVIEW_METHODOLOGY.md).
-        if name == "Consulting / Professional Fees":
+        if PROPERTY_IS_BRIO and name == "Consulting / Professional Fees":
             continue
         t12_flags[r] = (sev or "Moderate", "; ".join(reasons))
 
-# GL findings to enrich notes (manual from Phase 5)
+# GL findings to enrich notes (manual from Phase 5). Property-specific — the
+# analyst adds these per review; only applied to the property they belong to.
 GL_NOTES = {
     "Consulting / Professional Fees": "GL: vendor 'Oak Real Estate Investment' — Feb $1,285 + Mar $3,000 + Apr $3,000 all posted in May period; unbudgeted. Ask PM: nature of engagement, why unbudgeted, why multiple months booked at once (possible related party).",
     "Locator and Broker Referrals": "GL: Competitive Edge Realty (4 leases x $1,000) + Realty Texas + accrual true-ups. Heavy broker-locator leasing. Ask PM: confirm commissions tie to signed leases.",
     "Property Insurance": "GL: single prepaid amortization entry $17,121. Running UNDER budget (favorable) — likely renewal at lower premium. Ask PM: confirm new premium/term.",
     "Paint Contractor": "GL: R&C Painting & Cleaning — many unit make-ready invoices. Over budget PTD & YTD. Ask PM: turn volume driving paint spend.",
-}
+} if PROPERTY_IS_BRIO else {}
 
 # =======================================================================
 # Compute Budget flags (Phase 4)  -> {bc_row: (sev, note)}
 # =======================================================================
 bc_flags = {}
-SUPPRESS = {"Consulting / Professional Fees"}  # Brio: owner's own consulting fee
+# Brio: owner's own consulting fee — suppress only for Brio.
+SUPPRESS = {"Consulting / Professional Fees"} if PROPERTY_IS_BRIO else set()
 for recs in budget_by_name.values():
     for it in recs:
         if it["name"] in SUPPRESS:
@@ -398,12 +405,19 @@ oe = num(t12.cell(TOTAL_OPEX_ROW, REV).value); oe_p = num(t12.cell(TOTAL_OPEX_RO
 noi = num(t12.cell(NOI_ROW, REV).value); noi_p = num(t12.cell(NOI_ROW, PRI).value)
 b = SUB_BUDGET
 
-mr.cell(1, 1, "Brio (txbrio) — Monthly Financial Review").font = Font(bold=True, size=16)
-mr.cell(2, 1, "Review Period: May 2026  (Accrual)").font = Font(italic=True, size=11)
+# Property name, review/prior month labels, and book — read from the T12 header
+PROP = str(t12.cell(1, 1).value or "Property").strip()
+REVIEW_LABEL = str(t12.cell(5, REV).value or "Review Month").strip()
+PRIOR_LABEL = str(t12.cell(5, PRI).value or "Prior Month").strip()
+_bk = str(t12.cell(4, 1).value or "")
+BOOK = _bk.split("=", 1)[1].split(";")[0].strip() if "=" in _bk else "Accrual"
+
+mr.cell(1, 1, f"{PROP} — Monthly Financial Review").font = Font(bold=True, size=16)
+mr.cell(2, 1, f"Review Period: {REVIEW_LABEL}  ({BOOK})").font = Font(italic=True, size=11)
 
 row = 4
 row = sec(mr, row, "1. EXECUTIVE SUMMARY")
-hdrs = ["Metric", "May 2026", "Apr 2026", "MoM $", "MoM %", "YTD Actual", "YTD Budget", "YTD Var $", "YTD Var %"]
+hdrs = ["Metric", REVIEW_LABEL, PRIOR_LABEL, "MoM $", "MoM %", "YTD Actual", "YTD Budget", "YTD Var $", "YTD Var %"]
 for i, h in enumerate(hdrs, 1):
     c = mr.cell(row, i, h); c.fill = DARKBLUE; c.font = WHITE_BOLD
 row += 1
@@ -423,12 +437,18 @@ metric("Net Operating Income", noi, noi_p, b["noi"]["ya"], b["noi"]["yb"])
 mr.cell(row, 1, "NOI Margin"); mr.cell(row, 2, noi/ti if ti else 0); pct(mr.cell(row, 2))
 mr.cell(row, 3, noi_p/ti_p if ti_p else 0); pct(mr.cell(row, 3)); row += 2
 
-assess = ("On track with watch items: May NOI ${:,.0f} is {:+.1%} vs budget; YTD NOI is "
-          "{:+.1%} vs budget, pressured by revenue (loss-to-lease, vacancy) and make-ready / "
-          "marketing overruns. One unbudgeted item (Consulting/Professional Fees, $10,285) "
-          "warrants follow-up.").format(
-    noi, (noi-b["noi"]["pb"])/b["noi"]["pb"] if b["noi"]["pb"] else 0,
-    (b["noi"]["ya"]-b["noi"]["yb"])/b["noi"]["yb"] if b["noi"]["yb"] else 0)
+# Data-driven assessment (generic across properties)
+noi_ptd_var = (noi - b["noi"]["pb"]) / b["noi"]["pb"] if b["noi"]["pb"] else 0
+noi_ytd_var = (b["noi"]["ya"] - b["noi"]["yb"]) / b["noi"]["yb"] if b["noi"]["yb"] else 0
+n_high = sum(1 for s, _ in t12_flags.values() if s == "High")
+n_mod = sum(1 for s, _ in t12_flags.values() if s == "Moderate")
+_tone = ("requires attention" if (noi_ptd_var < -0.10 or n_high >= 3)
+         else "on track with watch items" if (noi_ptd_var < -0.03 or n_high or n_mod)
+         else "generally on track")
+assess = (f"{REVIEW_LABEL}: {_tone}. NOI ${noi:,.0f} is {noi_ptd_var:+.1%} vs budget (MTD); "
+          f"YTD NOI is {noi_ytd_var:+.1%} vs budget. "
+          f"{n_high} high / {n_mod} moderate item(s) flagged above the NOI line — see Section 2 "
+          f"and the month-focused questions in Section 5.")
 mr.cell(row, 1, "Assessment:").font = Font(bold=True)
 ac = mr.cell(row, 2, assess); ac.alignment = WRAP
 mr.merge_cells(start_row=row, start_column=2, end_row=row, end_column=9)
@@ -436,7 +456,7 @@ row += 3
 
 # Section 2: flagged items above the line
 row = sec(mr, row, "2. FLAGGED ITEMS — ABOVE THE NOI LINE")
-cols2 = ["GL Code", "Line Item", "May 2026", "Prior Mo", "3-Mo Avg", "PTD Budget", "Severity", "Finding / Question for PM"]
+cols2 = ["GL Code", "Line Item", REVIEW_LABEL, "Prior Mo", "3-Mo Avg", "PTD Budget", "Severity", "Finding / Question for PM"]
 for i, h in enumerate(cols2, 1):
     c = mr.cell(row, i, h); c.fill = DARKBLUE; c.font = WHITE_BOLD
 row += 1
@@ -463,7 +483,7 @@ row += 2
 
 # Section 3: below the line
 row = sec(mr, row, "3. BELOW-THE-LINE SUMMARY")
-for i, h in enumerate(["GL Code", "Line Item", "May 2026", "12-Mo Total", "Note"], 1):
+for i, h in enumerate(["GL Code", "Line Item", REVIEW_LABEL, "12-Mo Total", "Note"], 1):
     c = mr.cell(row, i, h); c.fill = DARKBLUE; c.font = WHITE_BOLD
 row += 1
 for r in range(NOI_ROW + 1, t12.max_row + 1):
@@ -529,13 +549,28 @@ scope = ("Scope: questions cover the current review month (MTD). YTD trends are 
 sc_cell = mr.cell(row, 2, scope); sc_cell.alignment = WRAP; sc_cell.font = Font(italic=True, color="1F4E79")
 mr.merge_cells(start_row=row, start_column=2, end_row=row, end_column=9)
 row += 1
-questions = [
-    "Locator & Broker Referrals: $13,660 this month (+646% vs 3-mo avg), $8,186 over PTD budget. Please confirm each commission ties to a signed lease (Competitive Edge Realty, 4 leases).",
-    "Make-Ready / turnover (Paint Contractor, Carpets, Other Make-Ready) ran over budget this month — this looks consistent with elevated move-ins / declining vacancy. Please confirm the turn count this month so we can tie make-ready spend to move-in volume.",
-    "Lease Cancellation Fee income was $0 this month vs. budget. Is this fee still being charged and collected?",
-    "Bad Debt – Accelerated Rent shows a POSITIVE balance. Was this amount recovered, or should it be reclassified out of Bad Debt (e.g., into Accelerated Rent)?",
-    "Internet Listing Services (Zillow, 54012-000): the Feb and March accruals were reversed with no offsetting actual expense booked, so those months understate ILS cost. Please confirm the true monthly ILS amount and rebook the missing actuals.",
-]
+if PROPERTY_IS_BRIO:
+    # Curated, analyst-authored questions for Brio (this review).
+    questions = [
+        "Locator & Broker Referrals: $13,660 this month (+646% vs 3-mo avg), $8,186 over PTD budget. Please confirm each commission ties to a signed lease (Competitive Edge Realty, 4 leases).",
+        "Make-Ready / turnover (Paint Contractor, Carpets, Other Make-Ready) ran over budget this month — this looks consistent with elevated move-ins / declining vacancy. Please confirm the turn count this month so we can tie make-ready spend to move-in volume.",
+        "Lease Cancellation Fee income was $0 this month vs. budget. Is this fee still being charged and collected?",
+        "Bad Debt – Accelerated Rent shows a POSITIVE balance. Was this amount recovered, or should it be reclassified out of Bad Debt (e.g., into Accelerated Rent)?",
+        "Internet Listing Services (Zillow, 54012-000): the Feb and March accruals were reversed with no offsetting actual expense booked, so those months understate ILS cost. Please confirm the true monthly ILS amount and rebook the missing actuals.",
+    ]
+else:
+    # Generic auto-draft from this month's flags (High first). The analyst should
+    # refine these per the house rules (REVIEW_METHODOLOGY.md) before sending.
+    questions = []
+    for r in sorted(t12_flags, key=lambda r: (0 if t12_flags[r][0] == "High" else 1,
+                                              -abs(num(t12.cell(r, REV).value)))):
+        sev, note = t12_flags[r]
+        nm = t12.cell(r, 2).value.strip()
+        questions.append(f"[{sev}] {nm}: {note} — please explain (and confirm via GL there is "
+                         f"no accrual reversed without an offsetting actual this month).")
+    if not questions:
+        questions = ["No month-specific items flagged above the NOI line. Confirm no accruals were "
+                     "reversed without an offsetting actual expense this month."]
 for i, q in enumerate(questions, 1):
     mr.cell(row, 1, i)
     qc = mr.cell(row, 2, q); qc.alignment = WRAP
@@ -547,7 +582,7 @@ widths = {1: 14, 2: 30, 3: 13, 4: 13, 5: 13, 6: 13, 7: 12, 8: 60, 9: 12}
 for col, w in widths.items():
     mr.column_dimensions[get_column_letter(col)].width = w
 
-OUT = WB.with_name("Brio_Financial_Analysis_202605_Reviewed.xlsx")
+OUT = WB.with_name(WB.stem + "_Reviewed.xlsx")
 try:
     wb.save(WB); saved = WB
 except PermissionError:
