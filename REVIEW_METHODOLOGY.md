@@ -39,6 +39,28 @@ these rules. Rules are split into **General** (apply to every property) and
    They should be level month-to-month; a change is something to reconcile against
    the table, not a default PM question.
 
+### A.6. Owner consulting fee (portfolio-wide)
+
+The recurring **$3,000/month Consulting / Professional Fees** to vendor
+**"Oak Real Estate Investment"** is the **owner's own consulting fee** and appears
+across multiple properties (confirmed on Brio and Sommery). It is expected and
+budgeted-in-substance — **never a PM question or related-party concern** on any
+property. `review_build.py` suppresses it from the PM-question list portfolio-wide
+(it still appears in the Section 2 flag table for transparency on non-Brio
+properties).
+
+### A.7. Auto-curation of PM questions
+
+`review_build.py` no longer dumps one raw question per flag. For non-Brio
+properties it runs every flag through a house-rule filter that: drops items
+favorable to / in line with budget (A.2: within 15% **and** under $1,000 variance),
+excludes tax/insurance/mortgage (A.5) and Gain/Loss to Lease (A.3), suppresses the
+owner consulting fee (A.6), reframes Make-Ready with turnover context (A.4),
+collapses the payroll/benefit cluster into a single pay-period note, and keeps
+genuine data-quality signals — sign anomalies (B.6) and new-this-month $0 lines
+(C.7). The **GL accrual-reversal confirmation (C.7) still requires the separate
+`gl_dive.py` step** — the analyst runs it on the surviving flags before sending.
+
 ### B. Data-quality / categorization checks
 
 6. **Positive value in a contra / bad-debt account** (e.g., "Bad Debt –

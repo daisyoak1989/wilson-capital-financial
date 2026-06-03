@@ -3,11 +3,54 @@ reports (12-month statement, budget comparison, general ledger) into a
 single Excel workbook with standardized tab names."""
 
 import argparse
+import json
+import re
 from copy import copy
 from pathlib import Path
 
 import openpyxl
 from openpyxl.utils import get_column_letter
+
+GLCODE_RE = re.compile(r"^\s*\d{5}-\d{3}\s*$")
+CODE_MAP_PATH = Path(__file__).with_name("account_codes.json")
+
+
+def _norm(s):
+    return re.sub(r"\s+", " ", str(s)).strip().lower() if s else ""
+
+
+def has_code_column(ws):
+    """True if column A already carries GL codes (e.g. '41000-000')."""
+    for r in range(1, min(ws.max_row, 80) + 1):
+        v = ws.cell(r, 1).value
+        if isinstance(v, str) and GLCODE_RE.match(v):
+            return True
+    return False
+
+
+def backfill_code_column(ws):
+    """Some 12-month-statement exports omit the leading GL-code column (account
+    names land in col A instead of col B). Downstream tools assume code=col A,
+    name=col B. Insert a blank col A and backfill codes from the portfolio-wide
+    account map so subtotal (-099/-098/...) detection and GL cross-ref work.
+    Returns (inserted, filled) counts; (False, 0) if the column was already present."""
+    if has_code_column(ws):
+        return False, 0
+    code_map = {}
+    if CODE_MAP_PATH.exists():
+        with open(CODE_MAP_PATH, encoding="utf-8") as fh:
+            code_map = json.load(fh)
+    ws.insert_cols(1)
+    filled = 0
+    for r in range(6, ws.max_row + 1):
+        name = ws.cell(r, 2).value
+        if not isinstance(name, str):
+            continue
+        code = code_map.get(_norm(name))
+        if code:
+            ws.cell(r, 1, code)
+            filled += 1
+    return True, filled
 
 # Source files are detected by glob pattern — filenames embed each property's
 # code (e.g. "txbrio"), so we match by shape rather than an exact name.
@@ -98,6 +141,8 @@ def main():
         dst_ws = dst_wb.create_sheet(title=tab)
         copy_sheet(src_ws, dst_ws)
         src_wb.close()
+        if tab == "T12":
+            backfill_code_column(dst_ws)  # silently fix exports missing the GL-code column
         print(f"  {src_path.name}  ->  tab {tab!r}  ({src_ws.max_row} rows x {src_ws.max_column} cols)")
 
     dst_wb.save(out)

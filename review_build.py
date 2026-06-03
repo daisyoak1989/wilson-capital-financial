@@ -14,9 +14,15 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from pathlib import Path
 
-# Workbook path: pass the combined workbook as argv[1]; falls back to Brio May 2026.
-DEFAULT_WB = Path(r"H:\.shortcut-targets-by-id\15cPT84Tcymc9b2jqyLRYJjcuEXIBOfOp\0. Business\Multi Family\!!! W.C. Portfolio\!!! Brio\Financial\202605\Brio_Financial_Analysis_202605.xlsx")
-WB = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_WB
+# Workbook path: the combined workbook MUST be passed as argv[1]. There is no
+# default — a silent fallback once caused this script to run on (and corrupt) an
+# unrelated already-reviewed workbook. Fail loudly instead.
+if len(sys.argv) < 2 or not sys.argv[1].strip():
+    sys.exit("Usage: review_build.py <combined workbook path>\n"
+             "       (run combine.py on the month folder first, then pass the workbook it saved.)")
+WB = Path(sys.argv[1])
+if not WB.is_file():
+    sys.exit(f"Workbook not found: {WB}\n(run combine.py first; this script is NOT idempotent.)")
 # Property-specific overrides only apply to the property they belong to.
 PROPERTY_IS_BRIO = "brio" in str(WB).lower()
 
@@ -57,7 +63,7 @@ WRAP = Alignment(wrap_text=True, vertical="top")
 def is_subtotal(code, name):
     if isinstance(code, str) and code.endswith(("-099", "-098", "-090", "-999", "-199")):
         return True
-    nm = name.strip() if name else ""
+    nm = str(name).strip() if name is not None else ""
     return ("Total" in nm) or nm.isupper()
 
 def t12_find(exact_name):
@@ -537,6 +543,81 @@ def a_i_key(key):
 vtable("PTD — Largest Unfavorable Variances", "pv", "pp")
 vtable("YTD — Largest Unfavorable Variances", "yv", "yp")
 
+# =======================================================================
+# House-rule question filter (REVIEW_METHODOLOGY.md). Turns the raw per-flag
+# list into a CURATED, current-month (MTD) question set so the generic path
+# matches the analyst's hand-curation instead of dumping every flag.
+# =======================================================================
+# A.5: names tracked in the portfolio tax/ins/mortgage reference table —
+# self-checked, never a PM question. NOTE: "Group Insurance" is an employee
+# benefit (payroll-adjacent), NOT property insurance — deliberately excluded.
+REF_TABLE_KEYS = ("Property Insurance", "Ad Valorem", "Property Tax",
+                  "Mortgage", "Interest Expense", "Debt Service")
+# Owner's own recurring consulting fee (vendor "Oak Real Estate Investment"),
+# portfolio-wide — expected, not unbudgeted/related-party (see methodology).
+OWNER_FEE_NAMES = ("Consulting / Professional Fees",)
+# A.2 tolerances: an unfavorable variance is only worth a question if it is both
+# materially off budget (> 15%) and a material dollar amount (>= $1,000).
+VAR_PCT_TOL = 0.15
+VAR_DOLLAR_TOL = 1000
+
+def question_filter(r, sev, note):
+    """Decide whether a flagged T12 row becomes a current-month PM question.
+    Returns (keep, text). Implements the REVIEW_METHODOLOGY house rules."""
+    code = t12.cell(r, 1).value
+    name = t12.cell(r, 2).value.strip()
+    rev = num(t12.cell(r, REV).value)
+    prior = num(t12.cell(r, PRI).value)
+    a3 = sum(num(t12.cell(r, c).value) for c in M3) / 3
+    is_income = str(code or "")[:1] == "4"
+
+    # A.5 / A.3 / owner-fee: never PM questions.
+    if any(k in name for k in REF_TABLE_KEYS):   # tax / insurance / mortgage
+        return False, None
+    if "Loss To Lease" in name:                  # expected market repricing (A.3)
+        return False, None
+    if name in OWNER_FEE_NAMES:                   # owner's own consulting fee
+        return False, None
+
+    # B.6 — sign anomalies (negative expense / non-contra income, positive in a
+    # contra account) always warrant a question + GL check, above a tiny floor.
+    if "NEGATIVE" in note or "POSITIVE in a contra" in note:
+        if abs(rev) < 500 and abs(a3) < 500:
+            return False, None                    # immaterial sign blip
+        return True, (f"{name}: {note} — please explain and confirm via the GL there is no "
+                      f"accrual reversed without an offsetting actual this month.")
+
+    # C.7 — a recurring line at $0. Only raise if it is a NEW drop this month
+    # (prior month > 0); a line already $0 last month is not an MTD event.
+    if "dropped to $0" in note:
+        if prior <= 0:
+            return False, None
+        return True, (f"{name}: posted $0 this month vs a ~${abs(a3):,.0f} run-rate "
+                      f"(prior month ${prior:,.0f}). Please confirm the accrual was booked — "
+                      f"a recurring expense at $0 may be a missing/un-booked accrual.")
+
+    # A.4 — Make-Ready / turnover: reframe with move-in/turnover context.
+    if "Make-Ready" in name or "Make Ready" in name:
+        return True, (f"{name}: ${rev:,.0f} this month, over budget. This looks consistent with "
+                      f"turnover — please confirm the move-out/move-in volume so we can tie "
+                      f"make-ready spend to turn activity rather than a true cost overrun.")
+
+    # A.2 — drop items favorable to / in line with budget, or immaterial in $.
+    b = lookup_budget(name, t12_bucket(str(code) if code else ""))
+    if b is None:
+        return False, None                        # no budget basis + no anomaly
+    favorable = b["pv"] >= 0                       # var col is favorable-positive
+    in_line = abs(b["pb"]) > 0 and abs(b["pv"]) / abs(b["pb"]) <= VAR_PCT_TOL
+    if favorable or in_line or abs(b["pv"]) < VAR_DOLLAR_TOL:
+        return False, None
+    # Skip expenses that are actually trending DOWN and below their recent
+    # average — any budget overage there is structural, not a new MTD event.
+    if not is_income and rev < prior and rev < a3:
+        return False, None
+
+    return True, (f"{name}: {note} — please explain and confirm via the GL there is no accrual "
+                  f"reversed without an offsetting actual this month.")
+
 # Section 5: questions for PM
 # House rules (see REVIEW_METHODOLOGY.md): questions are CURRENT-MONTH (MTD) only —
 # no YTD-driven questions; skip items favorable/in-line with budget; Gain/Loss to
@@ -549,28 +630,43 @@ scope = ("Scope: questions cover the current review month (MTD). YTD trends are 
 sc_cell = mr.cell(row, 2, scope); sc_cell.alignment = WRAP; sc_cell.font = Font(italic=True, color="1F4E79")
 mr.merge_cells(start_row=row, start_column=2, end_row=row, end_column=9)
 row += 1
-if PROPERTY_IS_BRIO:
-    # Curated, analyst-authored questions for Brio (this review).
-    questions = [
-        "Locator & Broker Referrals: $13,660 this month (+646% vs 3-mo avg), $8,186 over PTD budget. Please confirm each commission ties to a signed lease (Competitive Edge Realty, 4 leases).",
-        "Make-Ready / turnover (Paint Contractor, Carpets, Other Make-Ready) ran over budget this month — this looks consistent with elevated move-ins / declining vacancy. Please confirm the turn count this month so we can tie make-ready spend to move-in volume.",
-        "Lease Cancellation Fee income was $0 this month vs. budget. Is this fee still being charged and collected?",
-        "Bad Debt – Accelerated Rent shows a POSITIVE balance. Was this amount recovered, or should it be reclassified out of Bad Debt (e.g., into Accelerated Rent)?",
-        "Internet Listing Services (Zillow, 54012-000): the Feb and March accruals were reversed with no offsetting actual expense booked, so those months understate ILS cost. Please confirm the true monthly ILS amount and rebook the missing actuals.",
-    ]
-else:
-    # Generic auto-draft from this month's flags (High first). The analyst should
-    # refine these per the house rules (REVIEW_METHODOLOGY.md) before sending.
-    questions = []
-    for r in sorted(t12_flags, key=lambda r: (0 if t12_flags[r][0] == "High" else 1,
-                                              -abs(num(t12.cell(r, REV).value)))):
-        sev, note = t12_flags[r]
-        nm = t12.cell(r, 2).value.strip()
-        questions.append(f"[{sev}] {nm}: {note} — please explain (and confirm via GL there is "
-                         f"no accrual reversed without an offsetting actual this month).")
-    if not questions:
-        questions = ["No month-specific items flagged above the NOI line. Confirm no accruals were "
-                     "reversed without an offsetting actual expense this month."]
+# Curated from this month's flags via the house-rule question_filter (High
+# first), for ALL properties. Payroll/benefit lines are collapsed into one note:
+# they routinely spike together in a 3-paycheck month but still track budget.
+# Brio-specific GL findings (GL_NOTES) enrich the matching question.
+PAYROLL_KEYS = ("Salaries", "Burden", "Bonus", "Payroll")
+def is_payroll(nm):
+    return any(k in nm for k in PAYROLL_KEYS) or nm == "Group Insurance"
+questions = []
+payroll_lines = []
+for r in sorted(t12_flags, key=lambda r: (0 if t12_flags[r][0] == "High" else 1,
+                                          -abs(num(t12.cell(r, REV).value)))):
+    sev, note = t12_flags[r]
+    nm = t12.cell(r, 2).value.strip()
+    if is_payroll(nm):
+        # Collapse into the cluster note unless a single line is egregiously
+        # over budget (> 40% AND > $3,000) — then ask about it individually.
+        b = lookup_budget(nm, t12_bucket(str(t12.cell(r, 1).value or "")))
+        egregious = (b and b["pb"] and b["pv"] < 0
+                     and abs(b["pv"]) > 3000 and abs(b["pv"]) / abs(b["pb"]) > 0.40)
+        if not egregious:
+            payroll_lines.append(nm)
+            continue
+    keep, text = question_filter(r, sev, note)
+    if not keep:
+        continue
+    if nm in GL_NOTES:                       # Brio GL findings enrich the question
+        text += " " + GL_NOTES[nm]
+    questions.append(text)
+if payroll_lines:
+    questions.append(
+        "Payroll/benefit lines (" + ", ".join(payroll_lines) + ") rose vs prior month but "
+        "are broadly in line with budget MTD — consistent with pay-period timing (e.g., a "
+        "3-paycheck month) and any bonuses paid. Noted for context; flag if any portion is "
+        "off-cycle.")
+if not questions:
+    questions = ["No month-specific items flagged above the NOI line. Confirm no accruals were "
+                 "reversed without an offsetting actual expense this month."]
 for i, q in enumerate(questions, 1):
     mr.cell(row, 1, i)
     qc = mr.cell(row, 2, q); qc.alignment = WRAP
