@@ -14,6 +14,10 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from pathlib import Path
 
+# Recurring contract/subscription lines that should be ~level month-to-month
+# (house rule C.9). A material move flags a prior-month GL comparison.
+from gl_compare import is_stable_line
+
 # Workbook path: the combined workbook MUST be passed as argv[1]. There is no
 # default — a silent fallback once caused this script to run on (and corrupt) an
 # unrelated already-reviewed workbook. Fail loudly instead.
@@ -188,8 +192,12 @@ for r in range(6, NOI_ROW):
         sev = "High"; reasons.append(f"NEGATIVE other rental income ${rev:,.0f} — possible reversal/misposting.")
     if is_opex and rev < 0:
         sev = "High"; reasons.append(f"NEGATIVE expense ${rev:,.0f} — likely credit/reversal.")
+    # Stable recurring lines (C.9) must reach the opex rules below even when
+    # small — a $440->$180 contract move is sub-$500 but still worth a GL check —
+    # so they bypass the immaterial early-skip (Insurance is handled separately).
+    stable = is_opex and is_stable_line(name) and "Insurance" not in name
     immaterial = abs(rev) < 500 and abs(a3) < 500
-    if immaterial and not reasons:
+    if immaterial and not reasons and not stable:
         continue
     pm = (rev - prior) / abs(prior) if prior else None
     a3s = (rev - a3) / abs(a3) if a3 else None
@@ -225,6 +233,15 @@ for r in range(6, NOI_ROW):
             reasons.append(f"changed vs prior (${rev:,.0f} vs ${prior:,.0f}); should be level"); sev = sev or "Moderate"
         if any(u in name for u in ("Electric","Water","Gas","Utility")) and a3 and abs(rev) > 1.5*abs(a3) and abs(rev) > 2000:
             reasons.append(f"utility {abs(rev)/abs(a3):.0%} of 3-mo avg"); sev = sev or "Moderate"
+        # C.9 — recurring contract/subscription that moved vs its 3-mo run-rate
+        # (lower threshold than the generic spike rule; these are meant to be
+        # level, so even a few-hundred-dollar move warrants a prior-month GL check).
+        if stable:
+            base = a3 if a3 else prior
+            if base and abs(rev - base) / abs(base) > 0.25 and abs(rev - base) > 100:
+                reasons.append(f"stable recurring line moved {(rev-base)/base:+.0%} vs 3-mo avg "
+                               f"(${rev:,.0f} vs ${base:,.0f}) — verify vs prior-month GL")
+                sev = sev or "Moderate"
     if reasons:
         # suppress the Electric Commissions false positive (one-time item, $0 is normal)
         if name == "Electric Commissions":
@@ -579,13 +596,21 @@ def question_filter(r, sev, note):
     if name in OWNER_FEE_NAMES:                   # owner's own consulting fee
         return False, None
 
-    # B.6 — sign anomalies (negative expense / non-contra income, positive in a
-    # contra account) always warrant a question + GL check, above a tiny floor.
+    # B.6 / C.8 — sign anomalies (negative expense / non-contra income, positive
+    # in a contra account) ALWAYS warrant a question + GL check, regardless of the
+    # dollar amount (a small negative is still a reversal-without-offset signal —
+    # this is why a $227 "Car Services" credit must not be silently dropped).
     if "NEGATIVE" in note or "POSITIVE in a contra" in note:
-        if abs(rev) < 500 and abs(a3) < 500:
-            return False, None                    # immaterial sign blip
+        if abs(rev) < 1 and abs(a3) < 1:
+            return False, None                    # pure rounding noise only
         return True, (f"{name}: {note} — please explain and confirm via the GL there is no "
                       f"accrual reversed without an offsetting actual this month.")
+
+    # C.9 — a stable recurring contract/subscription that moved vs its run-rate:
+    # always ask, and verify against the previous month's GL (gl_compare.py).
+    if "verify vs prior-month GL" in note:
+        return True, (f"{name}: {note}. Please confirm the change is a real billing event "
+                      f"(not a double-post, a missed/duplicated accrual, or a reclass).")
 
     # C.7 — a recurring line at $0. Only raise if it is a NEW drop this month
     # (prior month > 0); a line already $0 last month is not an MTD event.

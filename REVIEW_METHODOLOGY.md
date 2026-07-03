@@ -57,9 +57,11 @@ favorable to / in line with budget (A.2: within 15% **and** under $1,000 varianc
 excludes tax/insurance/mortgage (A.5) and Gain/Loss to Lease (A.3), suppresses the
 owner consulting fee (A.6), reframes Make-Ready with turnover context (A.4),
 collapses the payroll/benefit cluster into a single pay-period note, and keeps
-genuine data-quality signals — sign anomalies (B.6) and new-this-month $0 lines
-(C.7). The **GL accrual-reversal confirmation (C.7) still requires the separate
-`gl_dive.py` step** — the analyst runs it on the surviving flags before sending.
+genuine data-quality signals — sign anomalies of **any size** (B.6 / C.8),
+new-this-month $0 lines (C.7), and stable recurring lines that moved (C.9). The
+**GL checks still require the separate scripts** — the analyst runs `gl_dive.py
+--rev` (C.7) and `gl_compare.py --auto` (C.8 negatives + C.9 cross-month) on the
+surviving flags before sending.
 
 ### B. Data-quality / categorization checks
 
@@ -99,6 +101,44 @@ genuine data-quality signals — sign anomalies (B.6) and new-this-month $0 line
    > then confirmed by pulling that account's GL for the month in question when
    > available. Use `gl_dive.py <code>` to inspect a section (it prints debit vs.
    > credit so reversal-vs-actual is visible).
+
+### C.8. Negative expense / sign anomaly — flag regardless of amount  ← **no dollar floor**
+
+8. **Any negative value in an expense account, and any sign anomaly** (a negative
+   in a normally-positive income line, a positive in a contra/bad-debt line) is a
+   **mandatory flag and a mandatory GL dive — there is NO materiality floor.** A
+   small negative is still the signature of an accrual reversed without an
+   offsetting actual; dollar size does not make it safe to ignore. *(This rule
+   exists because a $227 "Car Services" credit was once silently dropped as
+   "immaterial" when it was in fact a reversal with no re-booked actual.)*
+   `review_build.py` keeps every sign anomaly in both the flag table and the PM
+   questions; confirm each in the GL before sending.
+
+### C.9. Stable recurring expenses — compare against the PREVIOUS month's GL
+
+9. **Expenses that should be level month-to-month** — contract services, monthly
+   subscriptions/software, telephone/cellular/internet, trash, landscape, pest
+   control, elevator, alarm/security, etc. — get flagged on **any material move**
+   vs. their 3-month run-rate (lower threshold than the generic spike rule, since
+   they're *meant* to be flat). Because the GL export is **current-month only**,
+   the prior month's detail lives in the **previous month's folder** — so the
+   check is a **cross-month GL comparison**, not a single-month look.
+
+   - Run: `gl_compare.py --wb "<current workbook>" --auto`. It auto-resolves the
+     previous `YYYYMM` folder, and prints — side by side — the **current vs.
+     previous month's GL** for every stable line that moved (and dumps the
+     current-month GL for every negative expense, per C.8).
+   - **What to look for** in the side-by-side: a **double-posted draft** (an extra
+     billing the prior month didn't have), a **doubled accrual** (an accrual *and*
+     an actual both booked), a **reclass** (a charge credited out of one account
+     and debited into another — net-neutral, *not* a real change), or a **rolling
+     accrual** that never resolves to a vendor actual.
+
+   *Worked examples (Local DS, May 2026):* Trash Removal had an **extra $834
+   Conservice draft** the prior month lacked; Cellular **doubled** (a $250 accrual
+   + a $250 actual); Telephone's "drop" was just a **reclass into Fire Protection**
+   (net-neutral, no action). The reclass would read as a missing bill without the
+   prior-month comparison — which is the whole point of C.9.
 
 ---
 
